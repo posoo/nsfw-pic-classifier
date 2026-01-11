@@ -29,6 +29,29 @@ uv run python classify.py -i ./dir1 -i ./dir2 -r -o ./output
 | `--output` | `-o` | Output directory for classified images (default: current directory) |
 | `--recursive` | `-r` | Recursively search for images in subdirectories |
 | `--model` | | Custom Hugging Face model (default: `Falconsai/nsfw_image_detection`) |
+| `--batch-size` | `-b` | Number of images to process in each batch (default: 8) |
+| `--workers` | `-w` | Number of worker threads for I/O operations (default: 4) |
+
+## Performance
+
+The classifier uses parallel processing for optimal performance:
+
+- **GPU Acceleration**: Automatically detects and uses MPS (Apple Silicon), CUDA, or CPU
+- **Batch Inference**: Processes multiple images in a single model forward pass
+- **Parallel I/O**: Loads and copies files using multiple threads
+
+### Tuning Tips
+
+```bash
+# Larger batches for GPUs with more VRAM
+uv run python classify.py -i ./photos -b 16 -w 8
+
+# Smaller batches if running out of memory
+uv run python classify.py -i ./photos -b 4
+
+# More workers for network storage or fast NVMe
+uv run python classify.py -i ./photos -w 16
+```
 
 ## Supported Image Formats
 

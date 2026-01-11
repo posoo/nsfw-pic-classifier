@@ -9,6 +9,7 @@ using the Falconsai/nsfw_image_detection model from Hugging Face.
 import argparse
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Supported image extensions
@@ -45,7 +46,7 @@ def find_images(input_dirs: list[Path], recursive: bool) -> list[Path]:
 
 def load_dependencies():
     """Load heavy dependencies lazily."""
-    global Image, pipeline
+    global Image, pipeline, torch
 
     try:
         from PIL import Image
@@ -59,6 +60,12 @@ def load_dependencies():
         print("Error: transformers is not installed. Run: pip install transformers torch", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        import torch
+    except ImportError:
+        print("Error: torch is not installed. Run: pip install torch", file=sys.stderr)
+        sys.exit(1)
+
     # Register HEIF/HEIC format support if available
     try:
         from pillow_heif import register_heif_opener
@@ -66,24 +73,54 @@ def load_dependencies():
     except ImportError:
         pass
 
-    return Image, pipeline
+    return Image, pipeline, torch
 
 
-def classify_image(Image, classifier, image_path: Path) -> str:
-    """Classify a single image as 'normal' or 'nsfw'."""
+def get_device(torch):
+    """Detect the best available device (MPS for Apple Silicon, CUDA, or CPU)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def load_image(Image, image_path: Path):
+    """Load and preprocess a single image. Returns (path, image) or (path, None) on error."""
     try:
         img = Image.open(image_path)
         # Convert to RGB if necessary (for RGBA, grayscale, etc.)
         if img.mode != 'RGB':
             img = img.convert('RGB')
-
-        results = classifier(img)
-        # Get the label with highest score
-        top_result = max(results, key=lambda x: x['score'])
-        return top_result['label'].lower()
+        return (image_path, img)
     except Exception as e:
-        print(f"Error processing {image_path}: {e}", file=sys.stderr)
-        return None
+        print(f"Error loading {image_path}: {e}", file=sys.stderr)
+        return (image_path, None)
+
+
+def classify_batch(classifier, images: list) -> list:
+    """Classify a batch of images. Returns list of labels."""
+    try:
+        results = classifier(images)
+        # Results is a list of lists, one per image
+        labels = []
+        for result in results:
+            top_result = max(result, key=lambda x: x['score'])
+            labels.append(top_result['label'].lower())
+        return labels
+    except Exception as e:
+        print(f"Error during batch classification: {e}", file=sys.stderr)
+        return [None] * len(images)
+
+
+def copy_file(src: Path, dest: Path) -> bool:
+    """Copy a file to destination. Returns True on success."""
+    try:
+        shutil.copy2(src, dest)
+        return True
+    except Exception as e:
+        print(f"Error copying {src}: {e}", file=sys.stderr)
+        return False
 
 
 def main():
@@ -126,10 +163,24 @@ Examples:
         help='Hugging Face model to use (default: Falconsai/nsfw_image_detection)'
     )
 
+    parser.add_argument(
+        '--batch-size', '-b',
+        type=int,
+        default=8,
+        help='Number of images to process in each batch (default: 8)'
+    )
+
+    parser.add_argument(
+        '--workers', '-w',
+        type=int,
+        default=4,
+        help='Number of worker threads for I/O operations (default: 4)'
+    )
+
     args = parser.parse_args()
 
     # Load dependencies after argument parsing (so --help works without deps)
-    Image, pipeline = load_dependencies()
+    Image, pipeline, torch = load_dependencies()
 
     # Find all images
     print(f"Searching for images in {len(args.input_dirs)} director{'y' if len(args.input_dirs) == 1 else 'ies'}...")
@@ -148,45 +199,90 @@ Examples:
     normal_dir.mkdir(parents=True, exist_ok=True)
     nsfw_dir.mkdir(parents=True, exist_ok=True)
 
+    # Detect best available device
+    device = get_device(torch)
+    print(f"Using device: {device}")
+
     # Load the classifier
     print(f"Loading model: {args.model}...")
-    classifier = pipeline("image-classification", model=args.model)
+    classifier = pipeline("image-classification", model=args.model, device=device)
     print("Model loaded successfully")
+    print(f"Batch size: {args.batch_size}, Workers: {args.workers}")
 
-    # Process each image
+    # Process images in batches with parallel I/O
     stats = {'normal': 0, 'nsfw': 0, 'errors': 0}
+    total_images = len(images)
+    processed = 0
 
-    for i, image_path in enumerate(images, 1):
-        print(f"[{i}/{len(images)}] Processing: {image_path.name}...", end=' ')
+    # Process in batches
+    for batch_start in range(0, total_images, args.batch_size):
+        batch_end = min(batch_start + args.batch_size, total_images)
+        batch_paths = images[batch_start:batch_end]
 
-        label = classify_image(Image, classifier, image_path)
+        # Parallel image loading
+        loaded_images = []
+        valid_paths = []
 
-        if label is None:
-            stats['errors'] += 1
-            print("ERROR")
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(load_image, Image, path): path for path in batch_paths}
+            for future in as_completed(futures):
+                path, img = future.result()
+                if img is not None:
+                    loaded_images.append(img)
+                    valid_paths.append(path)
+                else:
+                    stats['errors'] += 1
+                    processed += 1
+                    print(f"[{processed}/{total_images}] {path.name}: ERROR (load failed)")
+
+        if not loaded_images:
             continue
 
-        # Determine destination
-        if label == 'nsfw':
-            dest_dir = nsfw_dir
-        else:
-            dest_dir = normal_dir
-            label = 'normal'  # Normalize label
+        # Batch classification
+        print(f"[{processed + 1}-{processed + len(loaded_images)}/{total_images}] Classifying batch of {len(loaded_images)} images...", end=' ', flush=True)
+        labels = classify_batch(classifier, loaded_images)
+        print("done")
 
-        # Handle filename conflicts
-        dest_path = dest_dir / image_path.name
-        if dest_path.exists():
-            stem = image_path.stem
-            suffix = image_path.suffix
-            counter = 1
-            while dest_path.exists():
-                dest_path = dest_dir / f"{stem}_{counter}{suffix}"
-                counter += 1
+        # Prepare copy operations
+        copy_tasks = []
+        for path, label in zip(valid_paths, labels):
+            processed += 1
 
-        # Copy the file
-        shutil.copy2(image_path, dest_path)
-        stats[label] += 1
-        print(f"{label.upper()}")
+            if label is None:
+                stats['errors'] += 1
+                print(f"  {path.name}: ERROR (classification failed)")
+                continue
+
+            # Determine destination
+            if label == 'nsfw':
+                dest_dir = nsfw_dir
+            else:
+                dest_dir = normal_dir
+                label = 'normal'
+
+            # Handle filename conflicts
+            dest_path = dest_dir / path.name
+            if dest_path.exists():
+                stem = path.stem
+                suffix = path.suffix
+                counter = 1
+                while dest_path.exists():
+                    dest_path = dest_dir / f"{stem}_{counter}{suffix}"
+                    counter += 1
+
+            copy_tasks.append((path, dest_path, label))
+
+        # Parallel file copying
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(copy_file, src, dest): (src, dest, label)
+                      for src, dest, label in copy_tasks}
+            for future in as_completed(futures):
+                src, dest, label = futures[future]
+                if future.result():
+                    stats[label] += 1
+                    print(f"  {src.name}: {label.upper()}")
+                else:
+                    stats['errors'] += 1
 
     # Print summary
     print("\n" + "=" * 40)
