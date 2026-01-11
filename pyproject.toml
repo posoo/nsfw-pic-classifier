@@ -1,0 +1,15 @@
+[project]
+name = "nsfw-pic-classifier"
+version = "0.1.0"
+description = "CLI tool to classify images into normal and nsfw categories"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=12.1.0",
+    "pillow-heif>=1.1.1",
+    "torch>=2.9.1",
+    "transformers>=4.57.3",
+]
+
+[project.scripts]
+classify = "classify:main"
